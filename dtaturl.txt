@@ -1,0 +1,27 @@
+数学数据集（强烈推荐）
+⭐ 1. OpenWebMath
+👉 https://huggingface.co/datasets/open-web-math
+14.7B tokens 高质量数学文本
+用于提升模型推理能力
+⭐ 2. GSM8K
+👉 https://huggingface.co/datasets/hkust-nlp/gsm8k-fix
+标准benchmark
+或者是：GSM8K Distilled（强烈推荐）
+👉 https://huggingface.co/datasets/camel-ai/gsm8k_distilled
+带完整推理步骤（Chain-of-Thought）
+已经是SFT格式
+⭐ 3. Calc-GSM8K（增强版）
+👉 https://huggingface.co/datasets/MU-NLPC/Calc-gsm8k
+扩展 GSM8K
+数据更多（17k+）
+
+
+
+
+
+Base Model 推荐
+🥇 最推荐
+👉 Qwen2 / Qwen2.5 (7B)
+🥈 备选
+👉 LLaMA 3 (8B)
+👉 DeepSeek（更强但更复杂）
