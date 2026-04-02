@@ -136,6 +136,7 @@ cache/
 
 # Training/evaluation generated artifacts
 data/math_sft/
+data/math_sft_v2/
 results/
 outputs-*/
 *.out

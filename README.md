@@ -35,12 +35,15 @@
 
 ### 2.2 训练数据集
 
-| 数据集 | 来源 | 数量 | 说明 |
-|--------|------|------|------|
-| [OpenWebMath](https://huggingface.co/datasets/open-web-math) | 网页数学文本 | 50,000 条（采样） | 14.7B tokens 高质量数学文本，经过长度和数学内容过滤 |
-| [NuminaMath-CoT](https://huggingface.co/datasets/AI-MO/NuminaMath-CoT) | 结构化数学 QA | 50,000 条（采样） | 带完整 Chain-of-Thought 推理步骤的数学题 |
+| 数据集 | 来源 | 数量 | 占比 | 说明 |
+|--------|------|------|------|------|
+| [NuminaMath-CoT](https://huggingface.co/datasets/AI-MO/NuminaMath-CoT) | 结构化数学 QA | 50,000 条 | **76.9%** | 带完整 Chain-of-Thought 推理步骤的数学题，直接对应 GSM8K 解题范式 |
+| [OpenWebMath](https://huggingface.co/datasets/open-web-math) | 网页数学文本 | 15,000 条（从 50K 随机采样） | 23.1% | 高质量数学文本，提供领域背景知识 |
+| **合计** | | **65,000 条** | 100% | 存放于 `data/math_sft_v2/` |
 
-**混合策略**：OpenWebMath 提供丰富的数学领域知识，NuminaMath-CoT 提供结构化的问题求解范式，两者互补。
+**混合策略**：以 NuminaMath-CoT（CoT 结构化解题）为主、OpenWebMath（数学背景知识）为辅，比例约 3.3:1，重点强化解题推理能力。训练集与验证集通过 `--validation_split_percentage 2` 自动切分（2% ≈ 1,274 条独立验证样本）。
+
+> **数据长度分布**（基于实际 tokenizer 估算）：P50 ≈ 711 tokens，P90 ≈ 2,143 tokens，无样本超过 4,096 tokens。`model_max_length=2048` 可覆盖约 89% 样本。
 
 ### 2.3 评估数据集
 
@@ -62,13 +65,18 @@ MathGPT/
 ├── scripts/
 │   └── convert_openwebmath.py        # [新增] OpenWebMath 数据转换脚本
 ├── eval_math_accuracy.py             # [新增] 数学推理准确率评估脚本
-├── run_math_sft.sh                   # [新增] 数学 SFT 训练启动脚本
-├── run_eval_math.sh                  # [新增] 评估流水线启动脚本
+├── run_math_sft.sh                   # [新增] 数学 SFT 训练启动脚本（本地）
+├── run_math_sft_TC2.sh               # [新增] TC2 集群 SLURM 训练脚本（含自动重提交）
+├── run_eval_math.sh                  # [新增] 评估流水线启动脚本（本地）
+├── run_eval_math_TC2.sh              # [新增] TC2 集群 SLURM 评估脚本
 │
 ├── data/
-│   └── math_sft/                     # [新增] 数学 SFT 训练数据目录
-│       ├── openwebmath_sft.jsonl     #   OpenWebMath 转换后数据
-│       └── numina_cot_sft.jsonl      #   NuminaMath-CoT 转换后数据
+│   ├── math_sft/                     # [旧版] 初始数据目录（50K OpenWebMath）
+│   │   ├── openwebmath_sft.jsonl
+│   │   └── numina_cot_sft.jsonl
+│   └── math_sft_v2/                  # [新增] 当前使用的训练数据目录（65K，调整比例）
+│       ├── numina_cot_sft.jsonl      #   NuminaMath-CoT 50K（76.9%）
+│       └── openwebmath_sft.jsonl     #   OpenWebMath 随机采样 15K（23.1%）
 ├── results/                          # [新增] 评估结果目录
 │
 ├── docs/
@@ -90,8 +98,11 @@ MathGPT/
 | GPU | 1x 24GB (RTX 3090/4090) | 1x 48GB (L40S/A6000) |
 | 内存 | 32GB | 64GB |
 | 磁盘 | 100GB 可用空间 | 200GB+ SSD |
+| Python | **3.10+**（必须） | 3.10 / 3.11 |
+| CUDA | 12.x | 12.8（TC2 集群） |
 
-> 本项目默认配置针对 **单卡 L40S 48GB** 优化。若使用 24GB 显卡，需启用 QLoRA 4bit 量化（在 `run_math_sft.sh` 中添加 `--load_in_4bit True`）。
+> 本项目默认配置针对 **单卡 L40S 48GB** 优化。若使用 24GB 显卡，需启用 QLoRA 4bit 量化（在 `run_math_sft.sh` 中添加 `--load_in_4bit True`）。  
+> **注意**：`transformers>=5.1.0`、`trl>=0.27.0`、`peft>=0.14.0` 均要求 Python 3.10+，不兼容 Python 3.9。
 
 ### 4.2 安装依赖
 
@@ -108,6 +119,18 @@ pip install -r requirements.txt --upgrade
 - `trl >= 0.27.0`
 - `math-verify == 0.5.2`（数学答案验证）
 - `latex2sympy2_extended`（LaTeX 解析）
+- `flash-attn`（FlashAttention-2，需单独安装，见下）
+
+**flash-attn 安装说明**：`flash-attn` 需要编译或匹配预编译 wheel，不能直接通过 `requirements.txt` 安装成功。请手动执行：
+
+```bash
+# TC2 集群（CUDA 12.8）
+CUDA_HOME=/apps/cuda_12.8.0 \
+PATH=/apps/cuda_12.8.0/bin:$PATH \
+pip install flash-attn --no-build-isolation --no-cache-dir
+```
+
+> `--no-cache-dir` 用于避免 pip 在跨文件系统移动 wheel 时报 `Invalid cross-device link` 错误。安装前可用 `nvcc --version` 确认 CUDA 版本。
 
 ---
 
@@ -115,30 +138,34 @@ pip install -r requirements.txt --upgrade
 
 ### 5.1 Phase 1: 数据准备
 
-**Step 1**：转换 NuminaMath-CoT 数据集（项目已有脚本）
+目标：构建 `data/math_sft_v2/` 目录，包含 NuminaMath-CoT（50K）和 OpenWebMath（15K）共 65,000 条训练样本。
+
+**Step 1**：转换 NuminaMath-CoT 数据集（取全量 50K）
 
 ```bash
 python docs/numina_cot_sharegpt.py \
     --train_end 50000 \
     --output_file numina_cot_sft.jsonl \
-    --local_dir data/math_sft
+    --local_dir data/math_sft_v2
 ```
 
-**Step 2**：转换 OpenWebMath 数据集
+**Step 2**：转换 OpenWebMath 数据集（随机采样 15K，比例约为 NuminaMath-CoT 的 30%）
 
 ```bash
 python scripts/convert_openwebmath.py \
-    --num_samples 50000 \
+    --num_samples 15000 \
     --min_length 500 \
     --max_length 8000 \
-    --output_dir data/math_sft
+    --output_dir data/math_sft_v2
 ```
+
+> **数据比例说明**：NuminaMath-CoT 含完整 Chain-of-Thought 推理步骤，与 GSM8K 解题范式直接对应，作为主要训练信号（76.9%）。OpenWebMath 提供数学领域背景知识，比例降至 23.1%，避免稀释解题能力。
 
 **Step 3**：验证数据格式
 
 ```bash
-python validate_jsonl.py --file_path data/math_sft/openwebmath_sft.jsonl
-python validate_jsonl.py --file_path data/math_sft/numina_cot_sft.jsonl
+python validate_jsonl.py --file_path data/math_sft_v2/numina_cot_sft.jsonl
+python validate_jsonl.py --file_path data/math_sft_v2/openwebmath_sft.jsonl
 ```
 
 转换后的数据格式（ShareGPT conversations）：
@@ -157,20 +184,40 @@ python validate_jsonl.py --file_path data/math_sft/numina_cot_sft.jsonl
 bash run_math_sft.sh
 ```
 
-**关键训练参数**：
+若使用 TC2 的 Slurm 脚本 `run_math_sft_TC2.sh`，请使用 **环境变量注入 token**（不在脚本中明文保存）：
+
+```bash
+conda activate env
+huggingface-cli login
+export HF_TOKEN=<your_hf_token>
+sbatch --export=ALL,HF_TOKEN=$HF_TOKEN run_math_sft_TC2.sh
+```
+
+说明：
+- `run_math_sft_TC2.sh` 会在启动时检查 `HF_TOKEN`，未提供则直接退出
+- 脚本内部会自动设置 `HUGGINGFACE_HUB_TOKEN`，并在超时自动重提交流程中继续传递 `HF_TOKEN`
+- 建议使用 `huggingface-cli whoami` 验证登录状态
+
+**关键训练参数**（以 `run_math_sft_TC2.sh` 为准）：
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | 基础模型 | `Qwen/Qwen3.5-9B` | 主力模型 |
-| LoRA rank | 16 | 适配 9B 模型 |
-| LoRA alpha | 32 | 2x rank |
-| 学习率 | 1e-4 | LoRA 推荐 |
-| 训练轮数 | 3 | 100K 样本 x 3 epochs |
-| 有效 batch size | 32 | 4 x 8 gradient accumulation |
-| 最大序列长度 | 2048 | 数学文本适用 |
+| 训练数据 | `data/math_sft_v2/`（65K） | NuminaMath-CoT 50K + OpenWebMath 15K |
+| LoRA rank | 8 | 轻量适配，节省显存 |
+| LoRA alpha | 16 | 2x rank |
+| LoRA dropout | 0.05 | 防过拟合 |
+| target_modules | all | 自动应用到所有线性层 |
+| 学习率 | 1e-4 | LoRA 推荐值 |
+| warmup ratio | 0.05 | 前 5% step 线性预热 |
+| weight decay | 0.01 | L2 正则 |
+| 训练轮数 | 2 | 65K 样本 × 2 epochs |
+| 有效 batch size | 64 | 1（per device）× 64（grad accum） |
+| 最大序列长度 | 2048 | 覆盖 ~89% 样本（P90 ≈ 2143 tokens） |
 | 精度 | bfloat16 | 混合精度训练 |
-| FlashAttention-2 | 启用 | 加速注意力计算 |
-| 梯度检查点 | 启用 | 节省显存 |
+| FlashAttention-2 | 启用 | 加速注意力计算，降低显存 |
+| 梯度检查点 | 启用 | 节省激活值显存 |
+| 验证集 | 自动切分 2%（≈1,274 条） | `--validation_split_percentage 2` |
 
 **监控训练进度**：
 
@@ -428,10 +475,10 @@ python eval_math_accuracy.py \
 ### 6.10 预期结果格式
 
 ```
-| Model                          | GSM8K Distilled | Calc-GSM8K |
-|--------------------------------|-----------------|------------|
-| Qwen3.5-9B baseline           | xx.x%           | xx.x%      |
-| Qwen3.5-9B + SFT (LoRA r=16) | xx.x%           | xx.x%      |
+| Model                         | GSM8K Distilled | Calc-GSM8K |
+|-------------------------------|-----------------|------------|
+| Qwen3.5-9B baseline          | xx.x%           | xx.x%      |
+| Qwen3.5-9B + SFT (LoRA r=8) | xx.x%           | xx.x%      |
 ```
 
 ---
@@ -477,16 +524,24 @@ python eval_math_accuracy.py \
 ```bash
 # 0. 安装依赖
 pip install -r requirements.txt --upgrade
+# flash-attn 需单独安装（TC2 集群）
+CUDA_HOME=/apps/cuda_12.8.0 PATH=/apps/cuda_12.8.0/bin:$PATH \
+    pip install flash-attn --no-build-isolation --no-cache-dir
 
 # 1. 准备数据（~10 min）
-python docs/numina_cot_sharegpt.py --train_end 50000 --output_file numina_cot_sft.jsonl --local_dir data/math_sft
-python scripts/convert_openwebmath.py --num_samples 50000 --output_dir data/math_sft
+# NuminaMath-CoT: 取全部 50K 条
+python docs/numina_cot_sharegpt.py --train_end 50000 \
+    --output_file numina_cot_sft.jsonl --local_dir data/math_sft_v2
+# OpenWebMath: 随机采样 15K 条（约为 NuminaMath-CoT 的 30%）
+python scripts/convert_openwebmath.py --num_samples 15000 \
+    --output_dir data/math_sft_v2
 
-# 2. 训练（~数小时，取决于 GPU）
-bash run_math_sft.sh
+# 2. 训练（TC2 集群，需提前设置 HF_TOKEN）
+export HF_TOKEN=<your_hf_token>
+sbatch --export=ALL,HF_TOKEN=$HF_TOKEN run_math_sft_TC2.sh
 
-# 3. 评估
-bash run_eval_math.sh
+# 3. 评估（TC2 集群）
+sbatch --export=ALL,HF_TOKEN=$HF_TOKEN run_eval_math_TC2.sh
 ```
 
 ---
