@@ -133,3 +133,10 @@ dmypy.json
 .cache/
 outputs-dpo-qwen-v1/
 cache/
+
+# Training/evaluation generated artifacts
+data/math_sft/
+results/
+outputs-*/
+*.out
+*.err
