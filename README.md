@@ -213,7 +213,7 @@ sbatch --export=ALL,HF_TOKEN=$HF_TOKEN run_math_sft_TC2.sh
 | weight decay | 0.01 | L2 正则 |
 | 训练轮数 | 2 | 65K 样本 × 2 epochs |
 | 有效 batch size | 64 | 1（per device）× 64（grad accum） |
-| 最大序列长度 | 2048 | 覆盖 ~89% 样本（P90 ≈ 2143 tokens） |
+| 最大序列长度 | 1024 | 覆盖 ~70% 样本；受 44GB GPU + fp32 logits 显存限制 |
 | 精度 | bfloat16 | 混合精度训练 |
 | FlashAttention-2 | 启用 | 加速注意力计算，降低显存 |
 | 梯度检查点 | 启用 | 节省激活值显存 |
@@ -269,217 +269,33 @@ python merge_peft_adapter.py \
 
 ---
 
-## 6. 评估方法：`eval_math_accuracy.py` 详解
+## 6. 答案提取与验证方法
 
-### 6.0 整体调用流程
-
-```
-main()
- ├── load_model_and_tokenizer(args)          # 加载模型 + tokenizer（可选 LoRA）
- ├── load_eval_dataset(dataset_name, ...)    # 加载并规范化评估数据集
- └── evaluate(model, tokenizer, samples, args)
-      ├── batch_generate(...)                # 批量推理，生成答案文本
-      └── 逐样本验证答案
-           ├── verify_answer_math_verify()   # 优先：符号化验证（math_verify 库）
-           └── verify_answer_regex()         # 回退：正则数值比较
-```
-
----
+答案验证采用两级策略：`math_verify` 符号比较（优先）→ 正则数值比较（回退）。
 
 ### 6.1 `extract_number_regex(text)` — 正则数字提取
 
-**功能**：从模型生成文本中提取数值答案，作为 `math_verify` 不可用时的基础工具。
+从模型输出中按优先级依次匹配（均取**最后一次**匹配，处理千位符 `,`）：
 
-**处理流程**（按优先级顺序）：
+| 优先级 | 策略 | 匹配模式 |
+|--------|------|---------|
+| 预处理 | 去除推理块 | `<think>...</think>` |
+| 1 | LaTeX boxed | `\boxed{N}` |
+| 2 | GSM8K 格式 | `#### N` |
+| 3 | 自然语言 | `The (final) answer is N` |
+| 4 | 兜底 | 文本中最后一个数字 |
 
-| 优先级 | 策略 | 匹配模式 | 示例 |
-|--------|------|---------|------|
-| 预处理 | 去除推理块 | `<think>...</think>` (DOTALL) | Qwen3.5 思维链标签 |
-| 1 | LaTeX boxed | `\boxed{N}` | `\boxed{42}` |
-| 2 | GSM8K 格式 | `#### N` | `#### 1,234` |
-| 3 | 自然语言 | `The (final) answer is N` | `The answer is $3.14$` |
-| 4 | 兜底 | 文本中最后一个数字 | 无结构化答案时 |
+### 6.2 `verify_answer_math_verify()` — 符号化验证（优先）
 
-- 所有策略均取**最后一次**匹配（应对多步推理），并处理千位分隔符（`,`）
-- 无法提取时返回 `None`
+使用 `math_verify` 库进行符号等价判断，支持分数、根号、科学计数法等。
 
----
+- 去除 `<think>...</think>` 后，用 `LatexExtractionConfig(boxed="all", boxed_match_priority=0)` 提取预测答案
+- 调用 `verify(answer_parsed, gold_parsed)` 返回 `1.0`（正确）/ `0.0`（错误）
+- 解析失败返回 `None`，触发回退
 
-### 6.2 `verify_answer_math_verify(prediction_text, ground_truth_text)` — 符号化答案验证
+### 6.3 `verify_answer_regex()` — 数值容差比较（回退）
 
-**功能**：使用 `math_verify` 库进行符号级别的答案等价判断，支持分数、根号、科学计数法等复杂数学表达式。
-
-**处理步骤**：
-
-1. **解析 ground truth**：
-   - 若含 `####`（GSM8K 格式），取 `####` 之后部分
-   - 否则用 `first_match` 模式提取第一个 LaTeX 表达式
-
-2. **解析 prediction**：
-   - 先去除 `<think>...</think>` 推理块
-   - 使用 `LatexExtractionConfig` 配置（关键参数）：
-     - `boxed="all"`：识别所有 `\boxed{}` 变体
-     - `basic_latex=True`：处理基础 LaTeX
-     - `equations=True`：处理等式
-     - `units=True`：处理带单位的答案
-     - `boxed_match_priority=0`：boxed 答案最高优先级
-
-3. **符号比较**：调用 `verify(answer_parsed, gold_parsed)` 返回 `float`（1.0 正确 / 0.0 错误）
-
-4. **异常处理**：解析/比较失败时返回 `None`，触发回退机制
-
----
-
-### 6.3 `verify_answer_regex(prediction_text, ground_truth_value)` — 数值容差比较
-
-**功能**：`math_verify` 失败或不可用时的回退验证方案。
-
-```python
-|pred - gt| < 1e-3  →  正确 (1.0)
-```
-
-- 调用 `extract_number_regex()` 提取预测值
-- `ground_truth_value` 为浮点数（由数据集加载时预提取）
-- 提取失败或类型转换失败均返回 `0.0`
-
----
-
-### 6.4 `load_model_and_tokenizer(args)` — 模型加载
-
-**功能**：加载 base model，可选附加 LoRA adapter，支持 4-bit 量化。
-
-**关键配置**：
-
-| 参数 | 值 | 说明 |
-|------|----|------|
-| `padding_side` | `'left'` | 批量生成必须左填充，避免 EOS 后生成 |
-| `device_map` | `"auto"` | 自动分配 GPU/CPU 内存 |
-| `torch_dtype` | `"auto"` | 从模型配置自动推断精度 |
-| `low_cpu_mem_usage` | `True` | 加速大模型加载 |
-| `load_in_4bit` | 可选 | QLoRA 推理，节省约 75% 显存 |
-
-**4-bit 量化配置**（`--load_in_4bit` 开启时）：
-```python
-BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-```
-
-**LoRA 挂载**：通过 `PeftModel.from_pretrained(model, lora_path)` 在 base model 之上叠加适配器权重，无需合并即可推理。
-
----
-
-### 6.5 `load_eval_dataset(dataset_name, num_samples=-1)` — 数据集加载
-
-**功能**：加载并规范化评估数据集，统一输出格式。
-
-**输出格式**（每条样本）：
-```python
-{
-    "question":          str,    # 题目文本
-    "ground_truth":      str,    # 原始答案字符串（含推理过程）
-    "ground_truth_value": float  # 预提取的数值答案（用于 regex 回退）
-}
-```
-
-**数据集差异**：
-
-| 字段 | `gsm8k_distilled` | `calc_gsm8k` |
-|------|-------------------|--------------|
-| HuggingFace ID | `camel-ai/gsm8k_distilled` | `MU-NLPC/Calc-gsm8k` |
-| split | `train` | `test` |
-| question 字段 | `problem` / `question` | `question` |
-| ground_truth | `groud_truth_solution`（注意原始拼写错误） | `result` |
-| ground_truth_value | 调用 `extract_number_regex()` 从 solution 提取 | 直接读取 `result_float` |
-
-`num_samples=-1` 时加载全部样本；`>0` 时截取前 N 条。
-
----
-
-### 6.6 `batch_generate(model, tokenizer, questions, ...)` — 批量推理
-
-**功能**：对题目列表进行批量推理，返回生成的答案文本列表。
-
-**关键实现细节**：
-
-- 装饰器 `@torch.inference_mode()` 禁用梯度计算，降低显存占用
-- 每道题套用统一 **system prompt**：
-  ```
-  You are a helpful math assistant. Solve the given math problem step by step.
-  Show your reasoning clearly. Put your final numerical answer within \boxed{}.
-  ```
-- 使用 `tokenizer.apply_chat_template()` 构造完整对话格式（适配各模型模板）
-- **答案截取**：仅解码 `outputs[i][prompt_len:]`，去除输入 prompt 部分
-- `temperature=0.0` 时自动切换为 greedy decoding（`do_sample=False`）
-
-**参数说明**：
-
-| 参数 | 说明 |
-|------|------|
-| `batch_size` | 每批处理题数，影响显存占用 |
-| `max_new_tokens` | 最大生成 token 数（默认 1024，CoT 推理需充足空间） |
-| `temperature` | 采样温度，0.0 为贪心解码（可复现） |
-
----
-
-### 6.7 `evaluate(model, tokenizer, samples, args)` — 评估主逻辑
-
-**功能**：调度生成与验证，汇总评估结果。
-
-**验证优先级**：
-
-```
-if HAS_MATH_VERIFY and ground_truth 非空:
-    result = verify_answer_math_verify(prediction, ground_truth)
-    if result is not None:  # 符号验证成功
-        is_correct = result
-        
-if is_correct == 0.0 and ground_truth_value 非空:
-    is_correct = verify_answer_regex(prediction, ground_truth_value)  # 回退
-```
-
-**返回值**：
-- `results`：每条样本的详细 dict（question / ground_truth / prediction / correct）
-- `accuracy`：百分比准确率（`float`）
-- `correct`：正确题数（`int`）
-- `total`：总题数（`int`）
-
----
-
-### 6.8 命令行参数一览
-
-```bash
-python eval_math_accuracy.py \
-    --base_model      Qwen/Qwen3.5-9B          # 必填：base model 路径或 HF ID
-    --lora_model      outputs-math-sft-qwen3.5-9b  # 可选：LoRA adapter 路径（空 = baseline）
-    --tokenizer_path  <path>                   # 可选：tokenizer 路径（默认同 base_model）
-    --eval_dataset    gsm8k_distilled          # 必填：gsm8k_distilled | calc_gsm8k
-    --num_samples     -1                       # 样本数（-1 = 全部）
-    --batch_size      4                        # 推理 batch size
-    --max_new_tokens  1024                     # 最大生成 token 数
-    --temperature     0.0                      # 0.0 = greedy decoding
-    --output_file     results/eval.jsonl       # 详细结果输出路径
-    --load_in_4bit                             # 启用 4-bit 量化（节省显存）
-```
-
-**输出文件**：
-- `<output_file>`：逐条 JSONL 详细结果
-- `<output_file>.replace('.jsonl', '_summary.json')`：汇总 JSON（含 accuracy 字段，供 `run_eval_math.sh` 读取）
-
----
-
-### 6.9 评估指标
-
-- **准确率（Accuracy）**：`correct / total × 100%`
-- 使用 **greedy decoding**（`temperature=0.0`）确保结果可复现
-- 答案验证策略：`math_verify` 符号比较（优先）→ 数值容差比较（`|Δ| < 1e-3`，回退）
-
-### 6.10 预期结果格式
-
-```
-| Model                         | GSM8K Distilled | Calc-GSM8K |
-|-------------------------------|-----------------|------------|
-| Qwen3.5-9B baseline          | xx.x%           | xx.x%      |
-| Qwen3.5-9B + SFT (LoRA r=8) | xx.x%           | xx.x%      |
-```
+`math_verify` 失败时使用：调用 `extract_number_regex()` 提取预测值，判断 `|pred - gt| < 1e-3`。
 
 ---
 
