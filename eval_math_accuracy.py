@@ -24,6 +24,12 @@ from transformers import (
 )
 
 try:
+    from vllm import LLM, SamplingParams
+    HAS_VLLM = True
+except ImportError:
+    HAS_VLLM = False
+
+try:
     from latex2sympy2_extended import NormalizationConfig
     from math_verify import LatexExtractionConfig, parse, verify
 
@@ -150,10 +156,17 @@ def load_model_and_tokenizer(args):
 
     config_kwargs = {
         "trust_remote_code": True,
-        "torch_dtype": "auto",
+        "torch_dtype": torch.bfloat16,
         "low_cpu_mem_usage": True,
         "device_map": "auto",
     }
+    # Use Flash Attention 2 if available (2-3x speedup on attention)
+    try:
+        import flash_attn  # noqa: F401
+        config_kwargs["attn_implementation"] = "flash_attention_2"
+        logger.info("Flash Attention 2 enabled")
+    except ImportError:
+        logger.info("Flash Attention 2 not available; using default attention")
     if args.load_in_4bit:
         config_kwargs['quantization_config'] = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -174,6 +187,23 @@ def load_model_and_tokenizer(args):
 
     model.eval()
     return model, tokenizer
+
+
+def load_vllm_model(args):
+    """Load model via vLLM for high-throughput inference."""
+    kwargs = dict(
+        dtype="bfloat16",
+        max_model_len=3072,
+        trust_remote_code=True,
+    )
+    if args.lora_model:
+        kwargs["enable_lora"] = True
+    llm = LLM(model=args.base_model, **kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_path or args.base_model,
+        trust_remote_code=True,
+    )
+    return llm, tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -233,27 +263,60 @@ SYSTEM_PROMPT = (
 )
 
 
+def batch_generate_vllm(llm, tokenizer, questions, max_new_tokens, temperature, lora_model=None):
+    """High-throughput generation using vLLM (PagedAttention + continuous batching)."""
+    from vllm.lora.request import LoRARequest
+
+    prompts = []
+    for q in questions:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": q},
+        ]
+        prompts.append(tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        ))
+
+    sampling_params = SamplingParams(
+        max_tokens=max_new_tokens,
+        temperature=temperature if temperature > 0.0 else 0.0,
+        top_p=1.0,
+    )
+    lora_req = LoRARequest("lora", 1, lora_model) if lora_model else None
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_req)
+    return [o.outputs[0].text.strip() for o in outputs]
+
+
 @torch.inference_mode()
 def batch_generate(model, tokenizer, questions, batch_size, max_new_tokens, temperature):
-    """Generate answers for a list of questions in batches."""
-    all_responses = []
+    """Generate answers for a list of questions in batches.
+
+    Inputs are sorted by prompt length before batching to minimise padding
+    waste, then results are restored to the original order.
+    """
+    n = len(questions)
     device = next(model.parameters()).device
 
-    for start in tqdm(range(0, len(questions), batch_size), desc="Generating"):
-        batch_questions = questions[start:start + batch_size]
+    # Build all prompts first so we can sort by length
+    prompts = []
+    for q in questions:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": q},
+        ]
+        prompts.append(tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        ))
 
-        prompts = []
-        for q in batch_questions:
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": q},
-            ]
-            prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            prompts.append(prompt)
+    # Sort by prompt character length to reduce intra-batch padding
+    order = sorted(range(n), key=lambda i: len(prompts[i]))
+    sorted_prompts = [prompts[i] for i in order]
+    sorted_responses = []
 
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048)
+    for start in tqdm(range(0, n, batch_size), desc="Generating"):
+        batch_prompts = sorted_prompts[start:start + batch_size]
+
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048)
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
 
@@ -269,7 +332,12 @@ def batch_generate(model, tokenizer, questions, batch_size, max_new_tokens, temp
             prompt_len = input_ids.shape[1]
             gen_tokens = gen_seq[prompt_len:]
             response = tokenizer.decode(gen_tokens, skip_special_tokens=True).strip()
-            all_responses.append(response)
+            sorted_responses.append(response)
+
+    # Restore original order
+    all_responses = [None] * n
+    for sorted_idx, orig_idx in enumerate(order):
+        all_responses[orig_idx] = sorted_responses[sorted_idx]
 
     return all_responses
 
@@ -344,24 +412,89 @@ def main():
     parser.add_argument('--output_file', type=str, default='results/eval_results.jsonl',
                         help='Output file for detailed results')
     parser.add_argument('--load_in_4bit', action='store_true', help='Load model in 4-bit quantization')
+    parser.add_argument('--use_vllm', action='store_true',
+                        help='Use vLLM for high-throughput inference (requires: pip install vllm)')
+    parser.add_argument('--start_index', type=int, default=0,
+                        help='Resume from this sample index (skips already-processed samples, appends to output_file)')
     args = parser.parse_args()
+
+    if args.use_vllm and not HAS_VLLM:
+        logger.error("vLLM requested but not installed. Run: pip install vllm")
+        raise SystemExit(1)
 
     # Load model
     model_label = "fine-tuned" if args.lora_model else "baseline"
-    logger.info(f"Evaluating {model_label} model on {args.eval_dataset}")
-    model, tokenizer = load_model_and_tokenizer(args)
+    logger.info(f"Evaluating {model_label} model on {args.eval_dataset} ({'vLLM' if args.use_vllm else 'HF Transformers'})")
+    if args.use_vllm:
+        model, tokenizer = load_vllm_model(args)
+    else:
+        model, tokenizer = load_model_and_tokenizer(args)
 
     # Load dataset
     samples = load_eval_dataset(args.eval_dataset, args.num_samples)
 
-    # Evaluate
-    results, accuracy, correct, total = evaluate(model, tokenizer, samples, args)
+    # Resume from checkpoint
+    if args.start_index > 0:
+        logger.info(f"Resuming from sample index {args.start_index} (skipping {args.start_index} already-processed samples)")
+        samples = samples[args.start_index:]
 
-    # Save detailed results
+    # Evaluate
+    if args.use_vllm:
+        questions = [s["question"] for s in samples]
+        logger.info(f"Generating answers for {len(questions)} questions via vLLM...")
+        start_time = time.time()
+        predictions = batch_generate_vllm(
+            model, tokenizer, questions,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            lora_model=args.lora_model or None,
+        )
+        elapsed = time.time() - start_time
+        logger.info(f"vLLM generation completed in {elapsed:.1f}s ({elapsed / len(questions):.2f}s/sample)")
+        # Reuse the scoring loop from evaluate()
+        correct, total_count = 0, 0
+        results = []
+        for sample, prediction in zip(samples, predictions):
+            is_correct = 0.0
+            if HAS_MATH_VERIFY and sample["ground_truth"]:
+                result = verify_answer_math_verify(prediction, sample["ground_truth"])
+                if result is not None:
+                    is_correct = result
+            if is_correct == 0.0 and sample["ground_truth_value"] is not None:
+                is_correct = verify_answer_regex(prediction, sample["ground_truth_value"])
+            correct += int(is_correct > 0.5)
+            total_count += 1
+            results.append({
+                "question": sample["question"],
+                "ground_truth": sample["ground_truth"],
+                "ground_truth_value": sample["ground_truth_value"],
+                "prediction": prediction,
+                "correct": bool(is_correct > 0.5),
+            })
+        accuracy = correct / total_count * 100 if total_count > 0 else 0.0
+        correct_out, total = correct, total_count
+        results_out = results
+    else:
+        results_out, accuracy, correct_out, total = evaluate(model, tokenizer, samples, args)
+
+    # Save detailed results (append when resuming, overwrite otherwise)
     os.makedirs(os.path.dirname(args.output_file) or '.', exist_ok=True)
-    with open(args.output_file, 'w', encoding='utf-8') as f:
-        for r in results:
+    write_mode = 'a' if args.start_index > 0 else 'w'
+    with open(args.output_file, write_mode, encoding='utf-8') as f:
+        for r in results_out:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
+
+    # When resuming, recompute accuracy over all samples in the output file
+    if args.start_index > 0:
+        all_results = []
+        with open(args.output_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    all_results.append(json.loads(line))
+        total = len(all_results)
+        correct_out = sum(1 for r in all_results if r['correct'])
+        accuracy = correct_out / total * 100 if total > 0 else 0.0
 
     # Print summary
     print("\n" + "=" * 60)
@@ -370,7 +503,7 @@ def main():
         print(f"  LoRA:     {args.lora_model}")
     print(f"  Dataset:  {args.eval_dataset}")
     print(f"  Samples:  {total}")
-    print(f"  Correct:  {correct}")
+    print(f"  Correct:  {correct_out}")
     print(f"  Accuracy: {accuracy:.2f}%")
     print("=" * 60)
     print(f"  Results saved to: {args.output_file}")
@@ -382,7 +515,7 @@ def main():
         "lora_model": args.lora_model or None,
         "eval_dataset": args.eval_dataset,
         "total": total,
-        "correct": correct,
+        "correct": correct_out,
         "accuracy": round(accuracy, 2),
     }
     with open(summary_file, 'w', encoding='utf-8') as f:

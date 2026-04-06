@@ -106,9 +106,20 @@ MathGPT/
 
 ### 4.2 安装依赖
 
+本项目使用两个独立的 conda 环境，以避免训练与推理依赖冲突：
+
+| 环境 | 用途 | 关键包 |
+|------|------|--------|
+| `env` | SFT 训练 + 标准推理 | transformers 5.x, peft, trl |
+| `env_vllm` | 高速评估推理（可选） | vLLM 0.19.0, transformers 4.x |
+
+**训练环境（`env`）**：
+
 ```bash
 git clone <repository-url>
 cd MathGPT
+conda create -n env python=3.10 -y
+conda activate env
 pip install -r requirements.txt --upgrade
 ```
 
@@ -119,9 +130,11 @@ pip install -r requirements.txt --upgrade
 - `trl >= 0.27.0`
 - `math-verify == 0.5.2`（数学答案验证）
 - `latex2sympy2_extended`（LaTeX 解析）
-- `flash-attn`（FlashAttention-2，需单独安装，见下）
 
-**flash-attn 安装说明**：`flash-attn` 需要编译或匹配预编译 wheel，不能直接通过 `requirements.txt` 安装成功。请手动执行：
+可选依赖：
+- `flash-attn`（FlashAttention-2，训练和推理均可加速 **2–3×**，见下）
+
+**flash-attn 安装说明（可选）**：`flash-attn` 不包含在 `requirements.txt` 中，需手动安装。未安装时脚本自动回退到标准 attention，功能不受影响。
 
 ```bash
 # TC2 集群（CUDA 12.8）
@@ -130,7 +143,20 @@ PATH=/apps/cuda_12.8.0/bin:$PATH \
 pip install flash-attn --no-build-isolation --no-cache-dir
 ```
 
-> `--no-cache-dir` 用于避免 pip 在跨文件系统移动 wheel 时报 `Invalid cross-device link` 错误。安装前可用 `nvcc --version` 确认 CUDA 版本。
+> `--no-cache-dir` 用于避免 pip 在跨文件系统移动 wheel 时报 `Invalid cross-device link` 错误。安装前可用 `nvcc --version` 确认 CUDA 版本。安装后，`eval_math_accuracy.py` 会在加载模型时自动检测并启用，无需额外参数。
+
+**推理加速环境（`env_vllm`，可选）**：
+
+vLLM 使用 PagedAttention + 连续批处理，推理速度比标准 HF Transformers 快 **5–10×**（9B 模型单卡约 400–800 tokens/s）。由于 vLLM 要求 transformers 4.x，与训练环境不兼容，需单独创建：
+
+```bash
+conda create -n env_vllm python=3.10 -y
+conda activate env_vllm
+pip install vllm==0.19.0 --no-cache-dir
+pip install peft loguru datasets math_verify latex2sympy2_extended --no-cache-dir
+```
+
+> 安装包较多（约 3–4 GB），建议在磁盘充裕时执行。`--no-cache-dir` 可有效避免配额超限。
 
 ---
 
@@ -227,20 +253,26 @@ tensorboard --logdir outputs-math-sft-qwen3.5-9b
 
 ### 5.3 Phase 3: 评估对比
 
-运行完整评估流水线（baseline + fine-tuned，两个数据集）：
+**TC2 集群（推荐）**：提交 SLURM 任务，支持断点续跑，默认使用 vLLM 加速：
+
+```bash
+sbatch run_eval_math_TC2.sh
+```
+
+**本地运行**：
 
 ```bash
 bash run_eval_math.sh
 ```
 
-或单独运行某个评估：
+**单独运行某个评估**（标准模式）：
 
 ```bash
 # Baseline 评估
 python eval_math_accuracy.py \
     --base_model Qwen/Qwen3.5-9B \
     --eval_dataset gsm8k_distilled \
-    --batch_size 4 \
+    --batch_size 16 \
     --max_new_tokens 1024 \
     --temperature 0.0 \
     --output_file results/baseline_gsm8k_distilled.jsonl
@@ -250,11 +282,46 @@ python eval_math_accuracy.py \
     --base_model Qwen/Qwen3.5-9B \
     --lora_model outputs-math-sft-qwen3.5-9b \
     --eval_dataset gsm8k_distilled \
-    --batch_size 4 \
+    --batch_size 16 \
     --max_new_tokens 1024 \
     --temperature 0.0 \
     --output_file results/finetuned_gsm8k_distilled.jsonl
 ```
+
+**启用 vLLM 加速（可选，需 `env_vllm` 环境）**：
+
+在命令末尾添加 `--use_vllm` 即可切换到 vLLM 推理路径，其余参数不变（`--batch_size` 在 vLLM 模式下不生效，由引擎自动管理）：
+
+```bash
+conda activate env_vllm
+
+# Baseline 评估（vLLM）
+python eval_math_accuracy.py \
+    --base_model Qwen/Qwen3.5-9B \
+    --eval_dataset gsm8k_distilled \
+    --max_new_tokens 1024 \
+    --temperature 0.0 \
+    --use_vllm \
+    --output_file results/baseline_gsm8k_distilled.jsonl
+
+# 微调模型评估（vLLM + LoRA）
+python eval_math_accuracy.py \
+    --base_model Qwen/Qwen3.5-9B \
+    --lora_model outputs-math-sft-qwen3.5-9b \
+    --eval_dataset gsm8k_distilled \
+    --max_new_tokens 1024 \
+    --temperature 0.0 \
+    --use_vllm \
+    --output_file results/finetuned_gsm8k_distilled.jsonl
+```
+
+**断点续跑**：评估中断后，再次提交 SLURM 任务会自动从上次中断的位置继续，无需额外操作。`--start_index N` 可手动指定从第 N 条样本开始（对应已输出的 `.jsonl` 行数）。
+
+| 模式 | 预计耗时（GSM8K 7455 条，单卡） | 适用场景 |
+|------|-------------------------------|---------|
+| 标准（HF Transformers） | ~19 小时 | 无 vLLM 环境 |
+| 标准 + Flash Attention 2 | ~7–10 小时 | 已安装 flash-attn |
+| vLLM | ~1–2 小时 | 已配置 `env_vllm` |
 
 ### 5.4 Phase 4: 合并权重（可选）
 
@@ -338,13 +405,20 @@ python merge_peft_adapter.py \
 ## 8. 快速开始（TL;DR）
 
 ```bash
-# 0. 安装依赖
+# 0. 安装训练环境
+conda create -n env python=3.10 -y && conda activate env
 pip install -r requirements.txt --upgrade
-# flash-attn 需单独安装（TC2 集群）
+# flash-attn 可选，安装后自动启用（2-3x 加速）
 CUDA_HOME=/apps/cuda_12.8.0 PATH=/apps/cuda_12.8.0/bin:$PATH \
     pip install flash-attn --no-build-isolation --no-cache-dir
 
+# 0b. 安装推理加速环境（可选，vLLM，评估快 5-10x）
+conda create -n env_vllm python=3.10 -y && conda activate env_vllm
+pip install vllm==0.19.0 --no-cache-dir
+pip install peft loguru datasets math_verify latex2sympy2_extended --no-cache-dir
+
 # 1. 准备数据（~10 min）
+conda activate env
 # NuminaMath-CoT: 取全部 50K 条
 python docs/numina_cot_sharegpt.py --train_end 50000 \
     --output_file numina_cot_sft.jsonl --local_dir data/math_sft_v2
@@ -356,8 +430,8 @@ python scripts/convert_openwebmath.py --num_samples 15000 \
 export HF_TOKEN=<your_hf_token>
 sbatch --export=ALL,HF_TOKEN=$HF_TOKEN run_math_sft_TC2.sh
 
-# 3. 评估（TC2 集群）
-sbatch --export=ALL,HF_TOKEN=$HF_TOKEN run_eval_math_TC2.sh
+# 3. 评估（TC2 集群，run_eval_math_TC2.sh 默认使用 env_vllm + vLLM）
+sbatch run_eval_math_TC2.sh
 ```
 
 ---

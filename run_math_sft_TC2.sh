@@ -81,7 +81,7 @@ python supervised_finetuning.py \
     --logging_steps 20 \
     --eval_steps 400 \
     --eval_strategy steps \
-    --save_steps 200 \
+    --save_steps 100 \
     --save_strategy steps \
     --save_total_limit 3 \
     --gradient_accumulation_steps 8 \
